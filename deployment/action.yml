@@ -1,0 +1,108 @@
+name: "Tailor PF deployment action"
+description: "Deploy Tailor PF apps"
+author: "Tailor Platform"
+inputs:
+  PF_ID:  
+    description: 'Platform User ID'
+    required: true
+  PF_PASSWORD:  
+    description: 'Platform User Password'
+    required: true
+  CUE_PACKAGE:  
+    description: 'Package name of Cue files'
+    required: true
+  WORKSPACE:  
+    description: 'Deployment workspace'
+    required: true
+  WORKSPACE_Admin:
+    description: 'Admin user id for the deployed environment'
+    required: true
+  WORKSPACE_PW: 
+    description: 'Admin user password for the deployed environment'
+    required: true
+  REPO_NAME: 
+    description: 'Repository name of the App'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+      - uses: actions/checkout@v3
+
+      - uses: cue-lang/setup-cue@v1.0.0-alpha.2
+
+      - name: Install latest tailorctl
+        uses: jaxxstorm/action-install-gh-release@v1.10.0
+        with:
+          repo: tailor-platform/tailorctl
+
+      - name: Login PF
+        shell: bash
+        run: tailorctl auth login -u ${{ inputs.PF_ID }} -p ${{ inputs.PF_PASSWORD }}
+
+      # - name: Delete workspace
+      #   shell: bash
+      #   run: |
+      #     tailorctl workspace list --format json | jq -R 'fromjson?' | jq -r '.[] | select ( .name ==  ${{inputs.WORKSPACE}} ) | .id' | xargs -I{} sh -c "tailorctl config set workspaceId {} && tailorctl workspace destroy --auto-approve"
+
+      - name: Create workspace
+        shell: bash
+        run: |
+          WS_NAME="${{ inputs.WORKSPACE }}"
+          echo "name=$WS_NAME" >> "$GITHUB_OUTPUT"
+          tailorctl workspace create \
+            --name "$WS_NAME" \
+            --owner-username ${{ inputs.WORKSPACE_Admin }} \
+            --owner-password ${{ inputs.WORKSPACE_PW }}
+        id: create_ws
+
+      - name: Create app
+        shell: bash
+        run: tailorctl app create "${{ steps.create_ws.outputs.name}}-app"
+
+      - uses: nowactions/envsubst@v1
+        with:
+          input: ./${{ inputs.REPO_NAME }}/values.ci.yaml
+          output: ./${{ inputs.REPO_NAME }}/values.${{ steps.create_ws.outputs.name }}.yaml
+        env:
+          NAME: ${{ steps.create_ws.outputs.name }}
+          PACKAGE: ${{inputs.CUE_PACKAGE}}
+
+      - name: Generate manifest
+        shell: bash
+        run: |
+          export CUE_PACKAGE=${{inputs.CUE_PACKAGE}}
+          ls -al
+          cat ./${{ inputs.REPO_NAME }}/values.${{ steps.create_ws.outputs.name }}.yaml
+          tailorctl template generate \
+            -t ./${{ inputs.REPO_NAME }}/template \
+            -o ./charts \
+            -f ./${{ inputs.REPO_NAME }}/values.${{ steps.create_ws.outputs.name }}.yaml
+      
+      - name: Create cue.mod 
+        shell: bash
+        run: tailorctl cue sync
+
+      - name: Create module.cue
+        shell: bash
+        run:
+          |-
+          echo "module: \"${{inputs.CUE_PACKAGE}}\"" > ./cue.mod/module.cue
+
+      - name: Vet cue files
+        shell: bash
+        run: find ./charts -name '*.cue' -type f -maxdepth 3 -exec sh -c 'i="$1"; echo "cue vet $i"; cue vet -c $i' shell {} \;
+
+      - name: Apply manifest
+        shell: bash
+        run: tailorctl app apply -m "./charts" --auto-approve
+
+      - name: Extract app information for debugging
+        shell: bash
+        run: |
+          {
+            echo "appID=$(tailorctl app describe --format json | jq -r .id)"
+            echo "gateway=$(tailorctl app describe --format json | jq -r .gateway)"
+          } >> "$GITHUB_OUTPUT"
+        id: extract_app
+
